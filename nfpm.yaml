@@ -29,5 +29,4 @@ contents:
       mode: 0700
 
 scripts:
-  postinstall: |
-    systemctl daemon-reload
+  postinstall: packaging/postinstall.sh
