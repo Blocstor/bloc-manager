@@ -1,0 +1,33 @@
+name: bloc-manager
+arch: amd64
+platform: linux
+version: ${VERSION}
+maintainer: Blocstor <blocstor@example.com>
+description: Orchestration backend for the Blocstor DRBD storage stack
+license: Apache-2.0
+
+contents:
+  - src: bloc-manager
+    dst: /usr/local/bin/bloc-manager
+    file_info:
+      mode: 0755
+
+  - src: systemd/bloc-manager.service
+    dst: /etc/systemd/system/bloc-manager.service
+    file_info:
+      mode: 0644
+
+  - src: agents.yaml
+    dst: /etc/bloc-manager/agents.yaml
+    type: config|noreplace
+    file_info:
+      mode: 0644
+
+  - dst: /var/lib/bloc-manager
+    type: dir
+    file_info:
+      mode: 0700
+
+scripts:
+  postinstall: |
+    systemctl daemon-reload

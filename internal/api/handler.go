@@ -1,0 +1,576 @@
+package api
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/blocstor/bloc-manager/internal/agent"
+	"github.com/blocstor/bloc-manager/internal/drbd"
+	"github.com/blocstor/bloc-manager/internal/store"
+)
+
+const (
+	defaultVG   = "vg0"
+	drbdPort    = 7789
+	drbdWaitDur = 2 * time.Second
+)
+
+// Handler holds the dependencies for all HTTP handlers.
+type Handler struct {
+	store       *store.Store
+	agentConfig *agent.Config
+	log         *slog.Logger
+}
+
+// New returns a new Handler.
+func New(s *store.Store, cfg *agent.Config, log *slog.Logger) *Handler {
+	return &Handler{store: s, agentConfig: cfg, log: log}
+}
+
+// RegisterRoutes registers all REST routes on mux.
+func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/volumes", h.volumeHandler)
+	mux.HandleFunc("/volumes/", h.volumeSubHandler)
+	mux.HandleFunc("/healthz", h.healthz)
+}
+
+// healthz returns 200 OK.
+func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok")) //nolint:errcheck
+}
+
+// volumeHandler handles POST /volumes and GET /volumes.
+func (h *Handler) volumeHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		h.createVolume(w, r)
+	case http.MethodGet:
+		h.listVolumes(w, r)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+// volumeSubHandler dispatches /volumes/:id and its sub-paths.
+func (h *Handler) volumeSubHandler(w http.ResponseWriter, r *http.Request) {
+	// Strip leading "/volumes/"
+	path := strings.TrimPrefix(r.URL.Path, "/volumes/")
+	parts := strings.SplitN(path, "/", 2)
+
+	id := parts[0]
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "missing volume id")
+		return
+	}
+
+	if len(parts) == 1 {
+		// /volumes/:id
+		h.volumeByIDHandler(w, r, id)
+		return
+	}
+
+	switch parts[1] {
+	case "publish":
+		h.publishHandler(w, r, id)
+	case "resize":
+		h.resizeHandler(w, r, id)
+	default:
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+// ---- volume CRUD ----
+
+type createVolumeRequest struct {
+	Name   string   `json:"name"`
+	SizeMB int      `json:"size_mb"`
+	Nodes  []string `json:"nodes"`
+}
+
+type volumeResponse struct {
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	Minor      int      `json:"minor"`
+	SizeMB     int      `json:"size_mb"`
+	Status     string   `json:"status"`
+	AttachedTo string   `json:"attached_to,omitempty"`
+	Nodes      []string `json:"nodes"`
+}
+
+func volumeToResponse(v store.Volume, status string) volumeResponse {
+	return volumeResponse{
+		ID:         v.ID,
+		Name:       v.Name,
+		Minor:      v.Minor,
+		SizeMB:     v.SizeMB,
+		Status:     status,
+		AttachedTo: v.AttachedTo,
+		Nodes:      v.Nodes,
+	}
+}
+
+func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
+	var req createVolumeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Name == "" {
+		writeError(w, http.StatusBadRequest, "name is required")
+		return
+	}
+	if req.SizeMB <= 0 {
+		writeError(w, http.StatusBadRequest, "size_mb must be positive")
+		return
+	}
+	if len(req.Nodes) == 0 {
+		writeError(w, http.StatusBadRequest, "at least one node is required")
+		return
+	}
+
+	ctx := r.Context()
+
+	minor, err := h.store.AllocateMinor()
+	if err != nil {
+		h.log.Error("allocate minor", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to allocate minor number")
+		return
+	}
+
+	id := newID()
+	lvName := fmt.Sprintf("drbd-%s", id)
+
+	// Build DRBD res nodes — derive addresses from agent config.
+	resNodes, err := h.buildResNodes(req.Nodes)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	resContent, err := drbd.RenderRes(drbd.ResData{
+		Name:   req.Name,
+		VG:     defaultVG,
+		LVName: lvName,
+		Minor:  minor,
+		Nodes:  resNodes,
+	})
+	if err != nil {
+		h.log.Error("render res", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to render DRBD res file")
+		return
+	}
+
+	// Step 1: create LVs and write res files on all nodes.
+	for _, nodeName := range req.Nodes {
+		client, err := h.clientFor(nodeName)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		if err := client.CreateLV(ctx, defaultVG, lvName, req.SizeMB); err != nil {
+			h.log.Error("create lv", "node", nodeName, "err", err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("create LV on %s: %v", nodeName, err))
+			return
+		}
+
+		if err := client.WriteRes(ctx, req.Name, resContent); err != nil {
+			h.log.Error("write res", "node", nodeName, "err", err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("write res on %s: %v", nodeName, err))
+			return
+		}
+	}
+
+	// Step 2: bring DRBD up on all nodes.
+	for _, nodeName := range req.Nodes {
+		client, _ := h.clientFor(nodeName) // already validated above
+		if err := client.DRBDUp(ctx, req.Name); err != nil {
+			h.log.Error("drbd up", "node", nodeName, "err", err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("drbd up on %s: %v", nodeName, err))
+			return
+		}
+	}
+
+	// Step 3: wait for DRBD sync to start.
+	time.Sleep(drbdWaitDur)
+
+	// Step 4: persist.
+	vol := store.Volume{
+		ID:         id,
+		Name:       req.Name,
+		Nodes:      req.Nodes,
+		Minor:      minor,
+		SizeMB:     req.SizeMB,
+		AttachedTo: "",
+	}
+	if err := h.store.CreateVolume(vol); err != nil {
+		h.log.Error("create volume in store", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to persist volume")
+		return
+	}
+
+	writeJSON(w, http.StatusCreated, volumeToResponse(vol, "available"))
+}
+
+func (h *Handler) listVolumes(w http.ResponseWriter, r *http.Request) {
+	vols, err := h.store.ListVolumes()
+	if err != nil {
+		h.log.Error("list volumes", "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to list volumes")
+		return
+	}
+
+	resp := make([]volumeResponse, 0, len(vols))
+	for _, v := range vols {
+		status := "available"
+		if v.AttachedTo != "" {
+			status = "attached"
+		}
+		resp = append(resp, volumeToResponse(v, status))
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handler) volumeByIDHandler(w http.ResponseWriter, r *http.Request, id string) {
+	switch r.Method {
+	case http.MethodGet:
+		h.getVolume(w, r, id)
+	case http.MethodDelete:
+		h.deleteVolume(w, r, id)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *Handler) getVolume(w http.ResponseWriter, r *http.Request, id string) {
+	v, err := h.store.GetVolume(id)
+	if err != nil {
+		h.log.Error("get volume", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to get volume")
+		return
+	}
+	if v == nil {
+		writeError(w, http.StatusNotFound, "volume not found")
+		return
+	}
+
+	status := "available"
+	if v.AttachedTo != "" {
+		status = "attached"
+	}
+	writeJSON(w, http.StatusOK, volumeToResponse(*v, status))
+}
+
+func (h *Handler) deleteVolume(w http.ResponseWriter, r *http.Request, id string) {
+	v, err := h.store.GetVolume(id)
+	if err != nil {
+		h.log.Error("get volume for delete", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to get volume")
+		return
+	}
+	if v == nil {
+		writeError(w, http.StatusNotFound, "volume not found")
+		return
+	}
+
+	ctx := r.Context()
+	lvName := fmt.Sprintf("drbd-%s", v.ID)
+
+	for _, nodeName := range v.Nodes {
+		client, err := h.clientFor(nodeName)
+		if err != nil {
+			h.log.Warn("no client for node during delete", "node", nodeName)
+			continue
+		}
+		// Best-effort teardown; ignore individual errors.
+		if err := client.DRBDSecondary(ctx, v.Name); err != nil {
+			h.log.Warn("drbd secondary on delete", "node", nodeName, "err", err)
+		}
+	}
+
+	for _, nodeName := range v.Nodes {
+		client, err := h.clientFor(nodeName)
+		if err != nil {
+			continue
+		}
+		if err := client.DRBDDown(ctx, v.Name); err != nil {
+			h.log.Warn("drbd down on delete", "node", nodeName, "err", err)
+		}
+	}
+
+	for _, nodeName := range v.Nodes {
+		client, err := h.clientFor(nodeName)
+		if err != nil {
+			continue
+		}
+		if err := client.RemoveRes(ctx, v.Name); err != nil {
+			h.log.Warn("remove res on delete", "node", nodeName, "err", err)
+		}
+		if err := client.RemoveLV(ctx, defaultVG, lvName); err != nil {
+			h.log.Warn("remove lv on delete", "node", nodeName, "err", err)
+		}
+	}
+
+	if err := h.store.DeleteVolume(id); err != nil {
+		h.log.Error("delete volume from store", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to delete volume from store")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---- publish ----
+
+type publishRequest struct {
+	Node string `json:"node"`
+}
+
+type publishResponse struct {
+	Node   string `json:"node"`
+	Device string `json:"device"`
+}
+
+func (h *Handler) publishHandler(w http.ResponseWriter, r *http.Request, id string) {
+	switch r.Method {
+	case http.MethodPost:
+		h.publishVolume(w, r, id)
+	case http.MethodDelete:
+		h.unpublishVolume(w, r, id)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (h *Handler) publishVolume(w http.ResponseWriter, r *http.Request, id string) {
+	var req publishRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.Node == "" {
+		writeError(w, http.StatusBadRequest, "node is required")
+		return
+	}
+
+	v, err := h.store.GetVolume(id)
+	if err != nil {
+		h.log.Error("get volume for publish", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to get volume")
+		return
+	}
+	if v == nil {
+		writeError(w, http.StatusNotFound, "volume not found")
+		return
+	}
+
+	ctx := r.Context()
+	client, err := h.clientFor(req.Node)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if err := client.DRBDPrimary(ctx, v.Name); err != nil {
+		h.log.Error("drbd primary", "node", req.Node, "err", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("promote DRBD on %s: %v", req.Node, err))
+		return
+	}
+
+	v.AttachedTo = req.Node
+	if err := h.store.UpdateVolume(*v); err != nil {
+		h.log.Error("update volume attached_to", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to update volume")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, publishResponse{
+		Node:   req.Node,
+		Device: fmt.Sprintf("/dev/drbd%d", v.Minor),
+	})
+}
+
+func (h *Handler) unpublishVolume(w http.ResponseWriter, r *http.Request, id string) {
+	v, err := h.store.GetVolume(id)
+	if err != nil {
+		h.log.Error("get volume for unpublish", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to get volume")
+		return
+	}
+	if v == nil {
+		writeError(w, http.StatusNotFound, "volume not found")
+		return
+	}
+
+	ctx := r.Context()
+	for _, nodeName := range v.Nodes {
+		client, err := h.clientFor(nodeName)
+		if err != nil {
+			h.log.Warn("no client for node during unpublish", "node", nodeName)
+			continue
+		}
+		if err := client.DRBDSecondary(ctx, v.Name); err != nil {
+			h.log.Warn("drbd secondary on unpublish", "node", nodeName, "err", err)
+		}
+	}
+
+	v.AttachedTo = ""
+	if err := h.store.UpdateVolume(*v); err != nil {
+		h.log.Error("update volume for unpublish", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to update volume")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// ---- resize ----
+
+type resizeRequest struct {
+	NewSizeMB int `json:"new_size_mb"`
+}
+
+type resizeResponse struct {
+	ID     string `json:"id"`
+	SizeMB int    `json:"size_mb"`
+}
+
+func (h *Handler) resizeHandler(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req resizeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if req.NewSizeMB <= 0 {
+		writeError(w, http.StatusBadRequest, "new_size_mb must be positive")
+		return
+	}
+
+	v, err := h.store.GetVolume(id)
+	if err != nil {
+		h.log.Error("get volume for resize", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to get volume")
+		return
+	}
+	if v == nil {
+		writeError(w, http.StatusNotFound, "volume not found")
+		return
+	}
+
+	if req.NewSizeMB <= v.SizeMB {
+		writeError(w, http.StatusBadRequest, "new_size_mb must be larger than current size")
+		return
+	}
+
+	addMB := req.NewSizeMB - v.SizeMB
+	lvName := fmt.Sprintf("drbd-%s", v.ID)
+	ctx := r.Context()
+
+	// Extend LV on all nodes.
+	for _, nodeName := range v.Nodes {
+		client, err := h.clientFor(nodeName)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := client.ExtendLV(ctx, defaultVG, lvName, addMB); err != nil {
+			h.log.Error("extend lv", "node", nodeName, "err", err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("extend LV on %s: %v", nodeName, err))
+			return
+		}
+	}
+
+	// Resize DRBD on the primary node, if attached.
+	if v.AttachedTo != "" {
+		client, err := h.clientFor(v.AttachedTo)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := client.DRBDResize(ctx, v.Name); err != nil {
+			h.log.Error("drbd resize", "node", v.AttachedTo, "err", err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("drbd resize on %s: %v", v.AttachedTo, err))
+			return
+		}
+	}
+
+	v.SizeMB = req.NewSizeMB
+	if err := h.store.UpdateVolume(*v); err != nil {
+		h.log.Error("update volume size", "id", id, "err", err)
+		writeError(w, http.StatusInternalServerError, "failed to update volume size")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, resizeResponse{ID: v.ID, SizeMB: v.SizeMB})
+}
+
+// ---- helpers ----
+
+// newID returns a random 8-byte hex string suitable for use as a volume ID.
+func newID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("crypto/rand failed: %v", err))
+	}
+	return hex.EncodeToString(b)
+}
+
+// clientFor returns an agent.Client for the named node, or an error if
+// the node is not in the configuration.
+func (h *Handler) clientFor(nodeName string) (*agent.Client, error) {
+	url, ok := h.agentConfig.Agents[nodeName]
+	if !ok {
+		return nil, fmt.Errorf("unknown node %q", nodeName)
+	}
+	return agent.NewClient(url), nil
+}
+
+// buildResNodes converts node names to drbd.ResNode entries using agent config
+// to derive the host address (stripping the http(s):// scheme and port).
+func (h *Handler) buildResNodes(nodes []string) ([]drbd.ResNode, error) {
+	result := make([]drbd.ResNode, 0, len(nodes))
+	for _, name := range nodes {
+		url, ok := h.agentConfig.Agents[name]
+		if !ok {
+			return nil, fmt.Errorf("unknown node %q", name)
+		}
+		// Strip scheme.
+		addr := strings.TrimPrefix(url, "https://")
+		addr = strings.TrimPrefix(addr, "http://")
+		// Strip port from base URL (agent port), keep only host.
+		if idx := strings.LastIndex(addr, ":"); idx != -1 {
+			addr = addr[:idx]
+		}
+		result = append(result, drbd.ResNode{
+			Hostname: name,
+			Address:  addr,
+			Port:     drbdPort,
+		})
+	}
+	return result, nil
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Error("write json response", "err", err)
+	}
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}
+

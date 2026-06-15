@@ -1,0 +1,12 @@
+[Unit]
+Description=bloc-manager
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/bloc-manager \
+    --db /var/lib/bloc-manager/state.db \
+    --agents /etc/bloc-manager/agents.yaml
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
