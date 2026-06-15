@@ -12,6 +12,7 @@ const resTemplate = `resource {{ .Name }} {
   }
   disk {
     on-io-error detach;
+    rs-discard-granularity 1M;
   }
   volume 0 {
     device minor {{ .Minor }};
