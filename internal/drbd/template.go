@@ -13,11 +13,6 @@ const resTemplate = `resource {{ .Name }} {
   disk {
     on-io-error detach;
   }
-  options {
-    quorum off;
-    on-no-quorum io-error;
-    auto-promote yes;
-  }
   volume 0 {
     device minor {{ .Minor }};
     disk /dev/{{ .VG }}/{{ .LVName }};
