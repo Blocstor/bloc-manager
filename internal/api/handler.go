@@ -188,7 +188,17 @@ func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 2: bring DRBD up on all nodes.
+	// Step 2: initialize DRBD metadata on all nodes (required for fresh devices).
+	for _, nodeName := range req.Nodes {
+		client, _ := h.clientFor(nodeName)
+		if err := client.DRBDCreateMD(ctx, req.Name); err != nil {
+			h.log.Error("drbd create-md", "node", nodeName, "err", err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("drbd create-md on %s: %v", nodeName, err))
+			return
+		}
+	}
+
+	// Step 3: bring DRBD up on all nodes.
 	for _, nodeName := range req.Nodes {
 		client, _ := h.clientFor(nodeName) // already validated above
 		if err := client.DRBDUp(ctx, req.Name); err != nil {
@@ -198,10 +208,10 @@ func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Step 3: wait for DRBD sync to start.
+	// Step 4: wait briefly for DRBD to settle.
 	time.Sleep(drbdWaitDur)
 
-	// Step 4: persist.
+	// Step 5: persist.
 	vol := store.Volume{
 		ID:         id,
 		Name:       req.Name,
@@ -378,8 +388,8 @@ func (h *Handler) publishVolume(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 
-	if err := client.DRBDPrimary(ctx, v.Name); err != nil {
-		h.log.Error("drbd primary", "node", req.Node, "err", err)
+	if err := client.DRBDPrimaryForce(ctx, v.Name); err != nil {
+		h.log.Error("drbd primary --force", "node", req.Node, "err", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("promote DRBD on %s: %v", req.Node, err))
 		return
 	}

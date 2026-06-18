@@ -137,6 +137,13 @@ func (c *Client) RemoveRes(ctx context.Context, name string) error {
 	})
 }
 
+// DRBDCreateMD initializes DRBD metadata on a fresh device.
+func (c *Client) DRBDCreateMD(ctx context.Context, resource string) error {
+	return c.post(ctx, "/drbd/create-md", map[string]any{
+		"resource": resource,
+	})
+}
+
 // DRBDUp brings up a DRBD resource.
 func (c *Client) DRBDUp(ctx context.Context, resource string) error {
 	return c.post(ctx, "/drbd/up", map[string]any{
@@ -154,6 +161,14 @@ func (c *Client) DRBDDown(ctx context.Context, resource string) error {
 // DRBDPrimary promotes a DRBD resource to Primary.
 func (c *Client) DRBDPrimary(ctx context.Context, resource string) error {
 	return c.post(ctx, "/drbd/primary", map[string]any{
+		"resource": resource,
+	})
+}
+
+// DRBDPrimaryForce forcibly promotes a DRBD resource to Primary.
+// Use when both peers are Inconsistent (fresh device initial setup).
+func (c *Client) DRBDPrimaryForce(ctx context.Context, resource string) error {
+	return c.post(ctx, "/drbd/primary-force", map[string]any{
 		"resource": resource,
 	})
 }
