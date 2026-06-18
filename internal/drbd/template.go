@@ -7,6 +7,9 @@ import (
 )
 
 const resTemplate = `resource {{ .Name }} {
+  options {
+    auto-promote yes;
+  }
   net {
     protocol C;
   }
