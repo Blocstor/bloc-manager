@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS meta (
 
 // NewStore opens the SQLite database at dsn and runs schema migrations.
 func NewStore(dsn string) (*Store, error) {
-	db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_foreign_keys=on")
+	db, err := sql.Open("sqlite3", dsn+"?_journal_mode=WAL&_foreign_keys=on&_busy_timeout=10000")
 	if err != nil {
 		return nil, fmt.Errorf("open db: %w", err)
 	}

@@ -148,7 +148,7 @@ func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
 	lvName := fmt.Sprintf("drbd-%s", id)
 
 	// Build DRBD res nodes — derive addresses from agent config.
-	resNodes, err := h.buildResNodes(req.Nodes)
+	resNodes, err := h.buildResNodes(req.Nodes, minor)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -539,7 +539,8 @@ func (h *Handler) clientFor(nodeName string) (*agent.Client, error) {
 
 // buildResNodes converts node names to drbd.ResNode entries using agent config
 // to derive the host address (stripping the http(s):// scheme and port).
-func (h *Handler) buildResNodes(nodes []string) ([]drbd.ResNode, error) {
+// minor is added to drbdPort so each resource uses a unique port.
+func (h *Handler) buildResNodes(nodes []string, minor int) ([]drbd.ResNode, error) {
 	result := make([]drbd.ResNode, 0, len(nodes))
 	for _, name := range nodes {
 		url, ok := h.agentConfig.Agents[name]
@@ -556,7 +557,7 @@ func (h *Handler) buildResNodes(nodes []string) ([]drbd.ResNode, error) {
 		result = append(result, drbd.ResNode{
 			Hostname: name,
 			Address:  addr,
-			Port:     drbdPort,
+			Port:     drbdPort + minor,
 		})
 	}
 	return result, nil
