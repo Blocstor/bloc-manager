@@ -20,6 +20,7 @@ func main() {
 	dbPath := flag.String("db", "/var/lib/bloc-manager/state.db", "path to SQLite database")
 	agentsPath := flag.String("agents", "agents.yaml", "path to agents config file")
 	logLevel := flag.String("log-level", "info", "log level: debug, info, warn, error")
+	vg := flag.String("vg", "vg0", "LVM volume group name for DRBD backing storage")
 	flag.Parse()
 
 	log := newLogger(*logLevel)
@@ -48,7 +49,7 @@ func main() {
 
 	// Build HTTP mux.
 	mux := http.NewServeMux()
-	h := api.New(st, agentCfg, log)
+	h := api.New(st, agentCfg, log, *vg)
 	h.RegisterRoutes(mux)
 
 	srv := &http.Server{

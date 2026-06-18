@@ -16,7 +16,6 @@ import (
 )
 
 const (
-	defaultVG   = "vg0"
 	drbdPort    = 7789
 	drbdWaitDur = 2 * time.Second
 )
@@ -26,11 +25,12 @@ type Handler struct {
 	store       *store.Store
 	agentConfig *agent.Config
 	log         *slog.Logger
+	vg          string
 }
 
 // New returns a new Handler.
-func New(s *store.Store, cfg *agent.Config, log *slog.Logger) *Handler {
-	return &Handler{store: s, agentConfig: cfg, log: log}
+func New(s *store.Store, cfg *agent.Config, log *slog.Logger, vg string) *Handler {
+	return &Handler{store: s, agentConfig: cfg, log: log, vg: vg}
 }
 
 // RegisterRoutes registers all REST routes on mux.
@@ -156,7 +156,7 @@ func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
 
 	resContent, err := drbd.RenderRes(drbd.ResData{
 		Name:   req.Name,
-		VG:     defaultVG,
+		VG:     h.vg,
 		LVName: lvName,
 		Minor:  minor,
 		Nodes:  resNodes,
@@ -175,7 +175,7 @@ func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		if err := client.CreateLV(ctx, defaultVG, lvName, req.SizeMB); err != nil {
+		if err := client.CreateLV(ctx, h.vg, lvName, req.SizeMB); err != nil {
 			h.log.Error("create lv", "node", nodeName, "err", err)
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("create LV on %s: %v", nodeName, err))
 			return
@@ -313,7 +313,7 @@ func (h *Handler) deleteVolume(w http.ResponseWriter, r *http.Request, id string
 		if err := client.RemoveRes(ctx, v.Name); err != nil {
 			h.log.Warn("remove res on delete", "node", nodeName, "err", err)
 		}
-		if err := client.RemoveLV(ctx, defaultVG, lvName); err != nil {
+		if err := client.RemoveLV(ctx, h.vg, lvName); err != nil {
 			h.log.Warn("remove lv on delete", "node", nodeName, "err", err)
 		}
 	}
@@ -485,7 +485,7 @@ func (h *Handler) resizeHandler(w http.ResponseWriter, r *http.Request, id strin
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := client.ExtendLV(ctx, defaultVG, lvName, addMB); err != nil {
+		if err := client.ExtendLV(ctx, h.vg, lvName, addMB); err != nil {
 			h.log.Error("extend lv", "node", nodeName, "err", err)
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("extend LV on %s: %v", nodeName, err))
 			return
