@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -47,6 +48,8 @@ func NewStore(dsn string) (*Store, error) {
 		return nil, fmt.Errorf("open db: %w", err)
 	}
 
+	db.SetMaxOpenConns(1)
+
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("run schema: %w", err)
@@ -71,7 +74,7 @@ func (s *Store) Close() error {
 
 // AllocateMinor atomically increments next_minor and returns the new value.
 func (s *Store) AllocateMinor() (int, error) {
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return 0, fmt.Errorf("begin tx: %w", err)
 	}
