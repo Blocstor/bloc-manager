@@ -11,12 +11,13 @@ import (
 
 // Volume represents a DRBD volume record.
 type Volume struct {
-	ID         string
-	Name       string
-	Nodes      []string
-	Minor      int
-	SizeMB     int
-	AttachedTo string
+	ID             string
+	Name           string
+	Nodes          []string
+	Minor          int
+	SizeMB         int
+	AttachedTo     string // Kubernetes node name (e.g., "cluster-a-worker-0")
+	AttachedDevice string // VM virtio device path (e.g., "/dev/vdb")
 }
 
 // Store wraps a SQLite database.
@@ -26,13 +27,14 @@ type Store struct {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS volumes (
-	id          TEXT PRIMARY KEY,
-	name        TEXT NOT NULL UNIQUE,
-	minor       INTEGER NOT NULL UNIQUE,
-	size_mb     INTEGER NOT NULL,
-	attached_to TEXT DEFAULT '',
-	nodes       TEXT NOT NULL,
-	created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+	id              TEXT PRIMARY KEY,
+	name            TEXT NOT NULL UNIQUE,
+	minor           INTEGER NOT NULL UNIQUE,
+	size_mb         INTEGER NOT NULL,
+	attached_to     TEXT DEFAULT '',
+	attached_device TEXT DEFAULT '',
+	nodes           TEXT NOT NULL,
+	created_at      DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS meta (
@@ -54,6 +56,9 @@ func NewStore(dsn string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("run schema: %w", err)
 	}
+
+	// Migrate: add attached_device column if it doesn't exist yet.
+	_, _ = db.Exec(`ALTER TABLE volumes ADD COLUMN attached_device TEXT DEFAULT ''`)
 
 	// Seed next_minor if not present.
 	_, err = db.Exec(
@@ -105,9 +110,9 @@ func (s *Store) CreateVolume(v Volume) error {
 	}
 
 	_, err = s.db.Exec(
-		`INSERT INTO volumes (id, name, minor, size_mb, attached_to, nodes)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
-		v.ID, v.Name, v.Minor, v.SizeMB, v.AttachedTo, string(nodesJSON),
+		`INSERT INTO volumes (id, name, minor, size_mb, attached_to, attached_device, nodes)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		v.ID, v.Name, v.Minor, v.SizeMB, v.AttachedTo, v.AttachedDevice, string(nodesJSON),
 	)
 	if err != nil {
 		return fmt.Errorf("insert volume: %w", err)
@@ -118,7 +123,7 @@ func (s *Store) CreateVolume(v Volume) error {
 // GetVolume retrieves a volume by ID.
 func (s *Store) GetVolume(id string) (*Volume, error) {
 	row := s.db.QueryRow(
-		`SELECT id, name, minor, size_mb, attached_to, nodes FROM volumes WHERE id=?`, id,
+		`SELECT id, name, minor, size_mb, attached_to, attached_device, nodes FROM volumes WHERE id=?`, id,
 	)
 	return scanVolume(row)
 }
@@ -126,7 +131,7 @@ func (s *Store) GetVolume(id string) (*Volume, error) {
 // ListVolumes returns all volumes.
 func (s *Store) ListVolumes() ([]Volume, error) {
 	rows, err := s.db.Query(
-		`SELECT id, name, minor, size_mb, attached_to, nodes FROM volumes ORDER BY created_at`,
+		`SELECT id, name, minor, size_mb, attached_to, attached_device, nodes FROM volumes ORDER BY created_at`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query volumes: %w", err)
@@ -152,8 +157,8 @@ func (s *Store) UpdateVolume(v Volume) error {
 	}
 
 	res, err := s.db.Exec(
-		`UPDATE volumes SET name=?, minor=?, size_mb=?, attached_to=?, nodes=? WHERE id=?`,
-		v.Name, v.Minor, v.SizeMB, v.AttachedTo, string(nodesJSON), v.ID,
+		`UPDATE volumes SET name=?, minor=?, size_mb=?, attached_to=?, attached_device=?, nodes=? WHERE id=?`,
+		v.Name, v.Minor, v.SizeMB, v.AttachedTo, v.AttachedDevice, string(nodesJSON), v.ID,
 	)
 	if err != nil {
 		return fmt.Errorf("update volume: %w", err)
@@ -195,7 +200,7 @@ func scanVolume(s scanner) (*Volume, error) {
 	var v Volume
 	var nodesJSON string
 
-	if err := s.Scan(&v.ID, &v.Name, &v.Minor, &v.SizeMB, &v.AttachedTo, &nodesJSON); err != nil {
+	if err := s.Scan(&v.ID, &v.Name, &v.Minor, &v.SizeMB, &v.AttachedTo, &v.AttachedDevice, &nodesJSON); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}

@@ -13,9 +13,17 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// VMInfo holds the libvirt information for a Kubernetes node's underlying VM.
+type VMInfo struct {
+	Host         string `yaml:"host"`          // KVM host agent name (must match an Agents key)
+	Domain       string `yaml:"domain"`        // libvirt domain name
+	AttachMethod string `yaml:"attach_method"` // "nbd" (default) or "pcie"
+}
+
 // Config holds the agent configuration loaded from agents.yaml.
 type Config struct {
 	Agents map[string]string `yaml:"agents"`
+	VMs    map[string]VMInfo `yaml:"vms"` // Kubernetes node name → VM info
 }
 
 // LoadConfig reads and parses the agents YAML configuration file.
@@ -203,4 +211,65 @@ func (c *Client) DRBDStatus(ctx context.Context, resource string) (string, error
 		return "", fmt.Errorf("decode status response: %w", err)
 	}
 	return result.Status, nil
+}
+
+// VMBlockList returns the virtio block device targets attached to a VM domain.
+func (c *Client) VMBlockList(ctx context.Context, domain string) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.baseURL+"/vm/blklist?domain="+domain, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var e errorResponse
+		if jsonErr := json.Unmarshal(body, &e); jsonErr == nil && e.Error != "" {
+			return nil, fmt.Errorf("agent error: %s", e.Error)
+		}
+		return nil, fmt.Errorf("agent returned HTTP %d", resp.StatusCode)
+	}
+	var result struct {
+		Targets []string `json:"targets"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return result.Targets, nil
+}
+
+// VMAttach hot-attaches a block device to a running libvirt domain.
+func (c *Client) VMAttach(ctx context.Context, domain, source, target string) error {
+	return c.post(ctx, "/vm/attach", map[string]any{
+		"domain": domain,
+		"source": source,
+		"target": target,
+	})
+}
+
+// VMDetach hot-detaches a virtio disk from a running libvirt domain by target name.
+func (c *Client) VMDetach(ctx context.Context, domain, target string) error {
+	return c.post(ctx, "/vm/detach", map[string]any{
+		"domain": domain,
+		"target": target,
+	})
+}
+
+// NBDServe starts a qemu-nbd server on the agent node exposing device on port.
+func (c *Client) NBDServe(ctx context.Context, device string, port int) error {
+	return c.post(ctx, "/nbd/serve", map[string]any{
+		"device": device,
+		"port":   port,
+	})
+}
+
+// NBDStop kills the qemu-nbd server running on the given port.
+func (c *Client) NBDStop(ctx context.Context, port int) error {
+	return c.post(ctx, "/nbd/stop", map[string]any{
+		"port": port,
+	})
 }

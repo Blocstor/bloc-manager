@@ -1,11 +1,13 @@
 package api
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -95,25 +97,69 @@ type createVolumeRequest struct {
 }
 
 type volumeResponse struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Minor      int      `json:"minor"`
-	SizeMB     int      `json:"size_mb"`
-	Status     string   `json:"status"`
-	AttachedTo string   `json:"attached_to,omitempty"`
-	Nodes      []string `json:"nodes"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	Minor          int      `json:"minor"`
+	SizeMB         int      `json:"size_mb"`
+	Status         string   `json:"status"`
+	AttachedTo     string   `json:"attached_to,omitempty"`
+	AttachedDevice string   `json:"attached_device,omitempty"`
+	Nodes          []string `json:"nodes"`
 }
 
 func volumeToResponse(v store.Volume, status string) volumeResponse {
 	return volumeResponse{
-		ID:         v.ID,
-		Name:       v.Name,
-		Minor:      v.Minor,
-		SizeMB:     v.SizeMB,
-		Status:     status,
-		AttachedTo: v.AttachedTo,
-		Nodes:      v.Nodes,
+		ID:             v.ID,
+		Name:           v.Name,
+		Minor:          v.Minor,
+		SizeMB:         v.SizeMB,
+		Status:         status,
+		AttachedTo:     v.AttachedTo,
+		AttachedDevice: v.AttachedDevice,
+		Nodes:          v.Nodes,
 	}
+}
+
+// agentHostIP extracts the host IP from an agent URL like "http://192.168.0.151:8080".
+func (h *Handler) agentHostIP(agentName string) string {
+	url, ok := h.agentConfig.Agents[agentName]
+	if !ok {
+		return agentName
+	}
+	addr := strings.TrimPrefix(url, "https://")
+	addr = strings.TrimPrefix(addr, "http://")
+	if idx := strings.LastIndex(addr, ":"); idx != -1 {
+		return addr[:idx]
+	}
+	return addr
+}
+
+// nbdPortFromDevice parses the port from an attached_device value like "nbd:10022".
+func nbdPortFromDevice(dev string) int {
+	s := strings.TrimPrefix(dev, "nbd:")
+	port := 0
+	fmt.Sscanf(s, "%d", &port)
+	return port
+}
+
+// pcieTargetFromDevice returns the virtio-blk target from "pcie:vdb".
+func pcieTargetFromDevice(dev string) string {
+	return strings.TrimPrefix(dev, "pcie:")
+}
+
+// vmNextTarget returns the next free virtio-blk target name ("vdb", "vdc", …)
+// given the set of already-attached targets.
+func vmNextTarget(used []string) string {
+	inUse := make(map[string]bool, len(used))
+	for _, t := range used {
+		inUse[t] = true
+	}
+	for _, c := range "bcdefghijklmnopqrstuvwxyz" {
+		if t := "vd" + string(c); !inUse[t] {
+			return t
+		}
+	}
+	return ""
 }
 
 func (h *Handler) createVolume(w http.ResponseWriter, r *http.Request) {
@@ -363,8 +409,10 @@ type publishRequest struct {
 }
 
 type publishResponse struct {
-	Node   string `json:"node"`
-	Device string `json:"device"`
+	Node    string `json:"node"`
+	Device  string `json:"device"`
+	NBDHost string `json:"nbd_host"`
+	NBDPort int    `json:"nbd_port"`
 }
 
 func (h *Handler) publishHandler(w http.ResponseWriter, r *http.Request, id string) {
@@ -400,30 +448,175 @@ func (h *Handler) publishVolume(w http.ResponseWriter, r *http.Request, id strin
 		return
 	}
 
-	ctx := r.Context()
-	client, err := h.clientFor(req.Node)
+	// Idempotent: if already published to the same node, check if connection is active.
+	if v.AttachedTo == req.Node {
+		if strings.HasPrefix(v.AttachedDevice, "nbd:") {
+			port := nbdPortFromDevice(v.AttachedDevice)
+			vmInfo, err := h.resolveVMInfo(r.Context(), req.Node)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			hostIP := h.agentHostIP(vmInfo.Host)
+			// Check if NBD server is active and listening on the current host.
+			addr := fmt.Sprintf("%s:%d", hostIP, port)
+			conn, err := net.DialTimeout("tcp", addr, 1*time.Second)
+			if err == nil {
+				conn.Close()
+				h.log.Info("NBD server is active, returning cached publish info", "addr", addr)
+				writeJSON(w, http.StatusOK, publishResponse{
+					Node:    req.Node,
+					Device:  "/dev/nbd0",
+					NBDHost: hostIP,
+					NBDPort: port,
+				})
+				return
+			}
+			h.log.Info("NBD server not active or host changed, proceeding to start it", "addr", addr, "err", err)
+		}
+		if strings.HasPrefix(v.AttachedDevice, "pcie:") {
+			target := pcieTargetFromDevice(v.AttachedDevice)
+			vmInfo, err := h.resolveVMInfo(r.Context(), req.Node)
+			if err == nil {
+				if kvmClient, err := h.clientFor(vmInfo.Host); err == nil {
+					if used, err := kvmClient.VMBlockList(r.Context(), vmInfo.Domain); err == nil {
+						// Check if target is in the list of attached devices.
+						attached := false
+						for _, u := range used {
+							if u == target {
+								attached = true
+								break
+							}
+						}
+						if attached {
+							h.log.Info("PCIe device is already attached to VM", "domain", vmInfo.Domain, "target", target)
+							writeJSON(w, http.StatusOK, publishResponse{
+								Node:   req.Node,
+								Device: "/dev/" + target,
+							})
+							return
+						}
+					}
+				}
+			}
+			h.log.Info("PCIe device not attached or error querying VM, proceeding to attach it", "target", target)
+		}
+	}
+
+	// Resolve the KVM host for this Kubernetes node.
+	vmInfo, err := h.resolveVMInfo(r.Context(), req.Node)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	if err := client.DRBDPrimaryForce(ctx, v.Name); err != nil {
-		h.log.Error("drbd primary --force", "node", req.Node, "err", err)
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("promote DRBD on %s: %v", req.Node, err))
+	kvmClient, err := h.clientFor(vmInfo.Host)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown kvm host %q for node %q", vmInfo.Host, req.Node))
 		return
 	}
 
-	v.AttachedTo = req.Node
-	if err := h.store.UpdateVolume(*v); err != nil {
-		h.log.Error("update volume attached_to", "id", id, "err", err)
-		writeError(w, http.StatusInternalServerError, "failed to update volume")
+	ctx := r.Context()
+	drbdDevice := fmt.Sprintf("/dev/drbd%d", v.Minor)
+
+	// Demote the volume on all other replication hosts first to avoid "Multiple primaries not allowed by config".
+	for _, nodeHost := range v.Nodes {
+		if nodeHost == vmInfo.Host {
+			continue
+		}
+		otherClient, err := h.clientFor(nodeHost)
+		if err != nil {
+			continue
+		}
+		h.log.Info("demoting volume on other host before promoting", "volume", v.Name, "otherHost", nodeHost)
+		// Stop NBD if applicable.
+		if strings.HasPrefix(v.AttachedDevice, "nbd:") {
+			port := nbdPortFromDevice(v.AttachedDevice)
+			_ = otherClient.NBDStop(ctx, port)
+		}
+		// Demote DRBD to Secondary.
+		if err := otherClient.DRBDSecondary(ctx, v.Name); err != nil {
+			h.log.Warn("failed to demote DRBD on other host", "volume", v.Name, "otherHost", nodeHost, "err", err)
+		}
+	}
+
+	// Promote DRBD to Primary on the KVM host.
+	if err := kvmClient.DRBDPrimaryForce(ctx, v.Name); err != nil {
+		h.log.Error("drbd primary --force", "host", vmInfo.Host, "err", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("promote DRBD on %s: %v", vmInfo.Host, err))
 		return
 	}
 
-	writeJSON(w, http.StatusOK, publishResponse{
-		Node:   req.Node,
-		Device: fmt.Sprintf("/dev/drbd%d", v.Minor),
-	})
+	attachMethod := vmInfo.AttachMethod
+	if attachMethod == "" {
+		attachMethod = "nbd"
+	}
+
+	switch attachMethod {
+	case "pcie":
+		used, err := kvmClient.VMBlockList(ctx, vmInfo.Domain)
+		if err != nil {
+			h.log.Error("vm block list", "host", vmInfo.Host, "domain", vmInfo.Domain, "err", err)
+			_ = kvmClient.DRBDSecondary(ctx, v.Name)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("list VM block devices on %s: %v", vmInfo.Host, err))
+			return
+		}
+
+		target := vmNextTarget(used)
+		if target == "" {
+			_ = kvmClient.DRBDSecondary(ctx, v.Name)
+			writeError(w, http.StatusInternalServerError, "no free virtio-blk target slots on VM")
+			return
+		}
+
+		if err := kvmClient.VMAttach(ctx, vmInfo.Domain, drbdDevice, target); err != nil {
+			h.log.Error("vm attach", "host", vmInfo.Host, "domain", vmInfo.Domain, "device", drbdDevice, "target", target, "err", err)
+			_ = kvmClient.DRBDSecondary(ctx, v.Name)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("attach device to VM on %s: %v", vmInfo.Host, err))
+			return
+		}
+
+		v.AttachedTo = req.Node
+		v.AttachedDevice = "pcie:" + target
+		if err := h.store.UpdateVolume(*v); err != nil {
+			h.log.Error("update volume attached_to", "id", id, "err", err)
+			_ = kvmClient.VMDetach(ctx, vmInfo.Domain, target)
+			_ = kvmClient.DRBDSecondary(ctx, v.Name)
+			writeError(w, http.StatusInternalServerError, "failed to update volume")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, publishResponse{
+			Node:   req.Node,
+			Device: "/dev/" + target,
+		})
+
+	default: // "nbd"
+		nbdPort := 10000 + v.Minor
+
+		if err := kvmClient.NBDServe(ctx, drbdDevice, nbdPort); err != nil {
+			h.log.Error("nbd serve", "host", vmInfo.Host, "device", drbdDevice, "port", nbdPort, "err", err)
+			_ = kvmClient.DRBDSecondary(ctx, v.Name)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("start NBD server on %s: %v", vmInfo.Host, err))
+			return
+		}
+
+		hostIP := h.agentHostIP(vmInfo.Host)
+		v.AttachedTo = req.Node
+		v.AttachedDevice = fmt.Sprintf("nbd:%d", nbdPort)
+		if err := h.store.UpdateVolume(*v); err != nil {
+			h.log.Error("update volume attached_to", "id", id, "err", err)
+			writeError(w, http.StatusInternalServerError, "failed to update volume")
+			return
+		}
+
+		writeJSON(w, http.StatusOK, publishResponse{
+			Node:    req.Node,
+			Device:  "/dev/nbd0",
+			NBDHost: hostIP,
+			NBDPort: nbdPort,
+		})
+	}
 }
 
 func (h *Handler) unpublishVolume(w http.ResponseWriter, r *http.Request, id string) {
@@ -439,6 +632,29 @@ func (h *Handler) unpublishVolume(w http.ResponseWriter, r *http.Request, id str
 	}
 
 	ctx := r.Context()
+
+	// Detach the volume from its VM (NBD or PCIe).
+	if v.AttachedTo != "" {
+		if vmInfo, err := h.resolveVMInfo(ctx, v.AttachedTo); err == nil {
+			if kvmClient, err := h.clientFor(vmInfo.Host); err == nil {
+				switch {
+				case strings.HasPrefix(v.AttachedDevice, "nbd:"):
+					port := nbdPortFromDevice(v.AttachedDevice)
+					if err := kvmClient.NBDStop(ctx, port); err != nil {
+						h.log.Warn("nbd stop on unpublish", "host", vmInfo.Host, "port", port, "err", err)
+					}
+				case strings.HasPrefix(v.AttachedDevice, "pcie:"):
+					target := pcieTargetFromDevice(v.AttachedDevice)
+					if err := kvmClient.VMDetach(ctx, vmInfo.Domain, target); err != nil {
+						h.log.Warn("vm detach on unpublish", "host", vmInfo.Host, "domain", vmInfo.Domain, "target", target, "err", err)
+					}
+				}
+			}
+		} else {
+			h.log.Warn("unable to resolve VM info for unpublish", "node", v.AttachedTo, "err", err)
+		}
+	}
+
 	for _, nodeName := range v.Nodes {
 		client, err := h.clientFor(nodeName)
 		if err != nil {
@@ -451,6 +667,7 @@ func (h *Handler) unpublishVolume(w http.ResponseWriter, r *http.Request, id str
 	}
 
 	v.AttachedTo = ""
+	v.AttachedDevice = ""
 	if err := h.store.UpdateVolume(*v); err != nil {
 		h.log.Error("update volume for unpublish", "id", id, "err", err)
 		writeError(w, http.StatusInternalServerError, "failed to update volume")
@@ -602,5 +819,41 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
+}
+
+// resolveVMInfo dynamically locates the host for a given VM node name by querying all agents.
+func (h *Handler) resolveVMInfo(ctx context.Context, nodeName string) (*agent.VMInfo, error) {
+	// First, check if it's in the static config.
+	if vmInfo, ok := h.agentConfig.VMs[nodeName]; ok {
+		// Verify if the VM is actually running on the configured host.
+		client, err := h.clientFor(vmInfo.Host)
+		if err == nil {
+			if _, err := client.VMBlockList(ctx, vmInfo.Domain); err == nil {
+				return &vmInfo, nil
+			}
+		}
+	}
+
+	// Probing all agents dynamically if it's not found or not active on the configured host.
+	for hostName := range h.agentConfig.Agents {
+		client, err := h.clientFor(hostName)
+		if err != nil {
+			continue
+		}
+		// In our platform, the domain name of the VM matches the Kubernetes node name (e.g. cluster-a-worker-0).
+		if _, err := client.VMBlockList(ctx, nodeName); err == nil {
+			attachMethod := "nbd"
+			if vmInfo, ok := h.agentConfig.VMs[nodeName]; ok && vmInfo.AttachMethod != "" {
+				attachMethod = vmInfo.AttachMethod
+			}
+			return &agent.VMInfo{
+				Host:         hostName,
+				Domain:       nodeName,
+				AttachMethod: attachMethod,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("VM %q not found or not running on any KVM host", nodeName)
 }
 
