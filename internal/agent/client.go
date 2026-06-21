@@ -197,20 +197,59 @@ func (c *Client) DRBDResize(ctx context.Context, resource string) error {
 
 // DRBDStatus returns the status string for a DRBD resource.
 func (c *Client) DRBDStatus(ctx context.Context, resource string) (string, error) {
-	body, err := c.postResp(ctx, "/drbd/status", map[string]any{
-		"resource": resource,
-	})
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		c.baseURL+"/drbd/status?resource="+resource, nil)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("build request: %w", err)
 	}
-
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var e errorResponse
+		if jsonErr := json.Unmarshal(body, &e); jsonErr == nil && e.Error != "" {
+			return "", fmt.Errorf("agent error: %s", e.Error)
+		}
+		return "", fmt.Errorf("agent returned HTTP %d", resp.StatusCode)
+	}
 	var result struct {
-		Status string `json:"status"`
+		Output string `json:"output"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return "", fmt.Errorf("decode status response: %w", err)
 	}
-	return result.Status, nil
+	return result.Output, nil
+}
+
+// ClusterQuorate returns true if the KVM host's Pacemaker/Corosync cluster has quorum.
+func (c *Client) ClusterQuorate(ctx context.Context) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/quorum", nil)
+	if err != nil {
+		return false, fmt.Errorf("build request: %w", err)
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("do request: %w", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		var e errorResponse
+		if jsonErr := json.Unmarshal(body, &e); jsonErr == nil && e.Error != "" {
+			return false, fmt.Errorf("agent error: %s", e.Error)
+		}
+		return false, fmt.Errorf("agent returned HTTP %d", resp.StatusCode)
+	}
+	var result struct {
+		Quorate bool `json:"quorate"`
+	}
+	if err := json.Unmarshal(body, &result); err != nil {
+		return false, fmt.Errorf("decode quorum response: %w", err)
+	}
+	return result.Quorate, nil
 }
 
 // VMBlockList returns the virtio block device targets attached to a VM domain.

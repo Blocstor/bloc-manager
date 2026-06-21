@@ -13,6 +13,9 @@ const resTemplate = `resource {{ .Name }} {
   net {
     protocol C;
     allow-two-primaries yes;
+    after-sb-0pri discard-zero-changes;
+    after-sb-1pri discard-secondary;
+    after-sb-2pri disconnect;
   }
   disk {
     on-io-error detach;

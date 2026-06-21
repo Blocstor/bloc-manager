@@ -519,22 +519,32 @@ func (h *Handler) publishVolume(w http.ResponseWriter, r *http.Request, id strin
 	ctx := r.Context()
 	drbdDevice := fmt.Sprintf("/dev/drbd%d", v.Minor)
 
-	// Determine if dual-primary mode can be activated.
-	// If len(v.Nodes) == 2, check if they are Connected (or Syncing) on the target host.
-	isDualPrimaryPossible := len(v.Nodes) > 2
-	if len(v.Nodes) == 2 {
-		status, err := kvmClient.DRBDStatus(ctx, v.Name)
-		if err == nil {
-			if strings.Contains(status, "connection:Connected") ||
-				strings.Contains(status, "connection:SyncSource") ||
-				strings.Contains(status, "connection:SyncTarget") {
-				isDualPrimaryPossible = true
-			} else {
-				h.log.Warn("DRBD connection is not Connected (no arbiter), falling back to single-primary", "volume", v.Name, "status", status)
+	// Determine if dual-primary mode can be activated by checking Pacemaker quorum
+	// on every storage node. If any node lacks quorum (or is unreachable), fall back
+	// to single-primary to avoid a split-brain scenario.
+	isDualPrimaryPossible := false
+	if len(v.Nodes) >= 2 {
+		allQuorate := true
+		for _, nodeHost := range v.Nodes {
+			client, err := h.clientFor(nodeHost)
+			if err != nil {
+				h.log.Warn("no client for node in quorum check, falling back to single-primary", "node", nodeHost, "err", err)
+				allQuorate = false
+				break
 			}
-		} else {
-			h.log.Warn("failed to query DRBD status, falling back to single-primary", "volume", v.Name, "err", err)
+			quorate, err := client.ClusterQuorate(ctx)
+			if err != nil {
+				h.log.Warn("quorum check failed, falling back to single-primary", "node", nodeHost, "err", err)
+				allQuorate = false
+				break
+			}
+			if !quorate {
+				h.log.Warn("node not quorate, falling back to single-primary", "node", nodeHost)
+				allQuorate = false
+				break
+			}
 		}
+		isDualPrimaryPossible = allQuorate
 	}
 
 	attachMethod := vmInfo.AttachMethod
