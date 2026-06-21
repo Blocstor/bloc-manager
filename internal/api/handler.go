@@ -519,35 +519,22 @@ func (h *Handler) publishVolume(w http.ResponseWriter, r *http.Request, id strin
 	ctx := r.Context()
 	drbdDevice := fmt.Sprintf("/dev/drbd%d", v.Minor)
 
-	// Demote the volume on all other replication hosts first to avoid "Multiple primaries not allowed by config".
-	for _, nodeHost := range v.Nodes {
-		if nodeHost == vmInfo.Host {
-			continue
-		}
-		otherClient, err := h.clientFor(nodeHost)
-		if err != nil {
-			continue
-		}
-		h.log.Info("demoting volume on other host before promoting", "volume", v.Name, "otherHost", nodeHost)
-		// Stop NBD if applicable. Always derive the port from v.Minor to clean up stale qemu-nbd servers,
-		// since v.AttachedDevice is cleared on a previous unpublish call.
-		port := 10000 + v.Minor
-		if err := otherClient.NBDStop(ctx, port); err != nil {
-			h.log.Warn("failed to stop NBD on other host", "volume", v.Name, "otherHost", nodeHost, "port", port, "err", err)
+	// Determine if dual-primary mode can be activated.
+	// If len(v.Nodes) == 2, check if they are Connected (or Syncing) on the target host.
+	isDualPrimaryPossible := len(v.Nodes) > 2
+	if len(v.Nodes) == 2 {
+		status, err := kvmClient.DRBDStatus(ctx, v.Name)
+		if err == nil {
+			if strings.Contains(status, "connection:Connected") ||
+				strings.Contains(status, "connection:SyncSource") ||
+				strings.Contains(status, "connection:SyncTarget") {
+				isDualPrimaryPossible = true
+			} else {
+				h.log.Warn("DRBD connection is not Connected (no arbiter), falling back to single-primary", "volume", v.Name, "status", status)
+			}
 		} else {
-			h.log.Info("stopped NBD on other host", "volume", v.Name, "otherHost", nodeHost, "port", port)
+			h.log.Warn("failed to query DRBD status, falling back to single-primary", "volume", v.Name, "err", err)
 		}
-		// Demote DRBD to Secondary.
-		if err := otherClient.DRBDSecondary(ctx, v.Name); err != nil {
-			h.log.Warn("failed to demote DRBD on other host", "volume", v.Name, "otherHost", nodeHost, "err", err)
-		}
-	}
-
-	// Promote DRBD to Primary on the KVM host.
-	if err := kvmClient.DRBDPrimaryForce(ctx, v.Name); err != nil {
-		h.log.Error("drbd primary --force", "host", vmInfo.Host, "err", err)
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("promote DRBD on %s: %v", vmInfo.Host, err))
-		return
 	}
 
 	attachMethod := vmInfo.AttachMethod
@@ -555,70 +542,181 @@ func (h *Handler) publishVolume(w http.ResponseWriter, r *http.Request, id strin
 		attachMethod = "nbd"
 	}
 
-	switch attachMethod {
-	case "pcie":
-		used, err := kvmClient.VMBlockList(ctx, vmInfo.Domain)
-		if err != nil {
-			h.log.Error("vm block list", "host", vmInfo.Host, "domain", vmInfo.Domain, "err", err)
-			_ = kvmClient.DRBDSecondary(ctx, v.Name)
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("list VM block devices on %s: %v", vmInfo.Host, err))
+	if isDualPrimaryPossible {
+		h.log.Info("activating dual-primary mode", "volume", v.Name)
+		// Promote DRBD on all replication hosts.
+		for _, nodeHost := range v.Nodes {
+			client, err := h.clientFor(nodeHost)
+			if err != nil {
+				h.log.Warn("no client for node in dual-primary promote", "node", nodeHost, "err", err)
+				continue
+			}
+			h.log.Info("promoting volume to Primary on host (dual-primary)", "volume", v.Name, "host", nodeHost)
+			if err := client.DRBDPrimaryForce(ctx, v.Name); err != nil {
+				h.log.Warn("failed to promote DRBD to Primary on host", "volume", v.Name, "host", nodeHost, "err", err)
+			}
+		}
+
+		switch attachMethod {
+		case "pcie":
+			used, err := kvmClient.VMBlockList(ctx, vmInfo.Domain)
+			if err != nil {
+				h.log.Error("vm block list in dual-primary", "host", vmInfo.Host, "domain", vmInfo.Domain, "err", err)
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("list VM block devices on %s: %v", vmInfo.Host, err))
+				return
+			}
+
+			target := vmNextTarget(used)
+			if target == "" {
+				writeError(w, http.StatusInternalServerError, "no free virtio-blk target slots on VM")
+				return
+			}
+
+			if err := kvmClient.VMAttach(ctx, vmInfo.Domain, drbdDevice, target); err != nil {
+				h.log.Error("vm attach in dual-primary", "host", vmInfo.Host, "domain", vmInfo.Domain, "device", drbdDevice, "target", target, "err", err)
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("attach device to VM on %s: %v", vmInfo.Host, err))
+				return
+			}
+
+			v.AttachedTo = req.Node
+			v.AttachedDevice = "pcie:" + target
+			if err := h.store.UpdateVolume(*v); err != nil {
+				h.log.Error("update volume attached_to in dual-primary pcie", "id", id, "err", err)
+				_ = kvmClient.VMDetach(ctx, vmInfo.Domain, target)
+				writeError(w, http.StatusInternalServerError, "failed to update volume")
+				return
+			}
+
+			writeJSON(w, http.StatusOK, publishResponse{
+				Node:   req.Node,
+				Device: "/dev/" + target,
+			})
+
+		default: // "nbd"
+			nbdPort := 10000 + v.Minor
+
+			// Start qemu-nbd on all hosts.
+			for _, nodeHost := range v.Nodes {
+				client, err := h.clientFor(nodeHost)
+				if err != nil {
+					h.log.Warn("no client for node in dual-primary nbd start", "node", nodeHost, "err", err)
+					continue
+				}
+				h.log.Info("starting qemu-nbd on host", "volume", v.Name, "host", nodeHost, "port", nbdPort)
+				if err := client.NBDServe(ctx, drbdDevice, nbdPort); err != nil {
+					h.log.Warn("failed to start NBD server on host", "volume", v.Name, "host", nodeHost, "port", nbdPort, "err", err)
+				}
+			}
+
+			hostIP := h.agentHostIP(vmInfo.Host)
+			v.AttachedTo = req.Node
+			v.AttachedDevice = fmt.Sprintf("nbd:%d", nbdPort)
+			if err := h.store.UpdateVolume(*v); err != nil {
+				h.log.Error("update volume attached_to in dual-primary nbd", "id", id, "err", err)
+				writeError(w, http.StatusInternalServerError, "failed to update volume")
+				return
+			}
+
+			writeJSON(w, http.StatusOK, publishResponse{
+				Node:    req.Node,
+				Device:  "/dev/nbd0",
+				NBDHost: hostIP,
+				NBDPort: nbdPort,
+			})
+		}
+	} else {
+		h.log.Info("falling back to single-primary mode", "volume", v.Name)
+		// Demote the volume on all other replication hosts first.
+		for _, nodeHost := range v.Nodes {
+			if nodeHost == vmInfo.Host {
+				continue
+			}
+			otherClient, err := h.clientFor(nodeHost)
+			if err != nil {
+				continue
+			}
+			h.log.Info("demoting volume on other host before promoting (single-primary)", "volume", v.Name, "otherHost", nodeHost)
+			port := 10000 + v.Minor
+			if err := otherClient.NBDStop(ctx, port); err != nil {
+				h.log.Warn("failed to stop NBD on other host", "volume", v.Name, "otherHost", nodeHost, "port", port, "err", err)
+			}
+			if err := otherClient.DRBDSecondary(ctx, v.Name); err != nil {
+				h.log.Warn("failed to demote DRBD on other host", "volume", v.Name, "otherHost", nodeHost, "err", err)
+			}
+		}
+
+		// Promote DRBD to Primary on the target KVM host.
+		if err := kvmClient.DRBDPrimaryForce(ctx, v.Name); err != nil {
+			h.log.Error("drbd primary --force (single-primary)", "host", vmInfo.Host, "err", err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("promote DRBD on %s: %v", vmInfo.Host, err))
 			return
 		}
 
-		target := vmNextTarget(used)
-		if target == "" {
-			_ = kvmClient.DRBDSecondary(ctx, v.Name)
-			writeError(w, http.StatusInternalServerError, "no free virtio-blk target slots on VM")
-			return
+		switch attachMethod {
+		case "pcie":
+			used, err := kvmClient.VMBlockList(ctx, vmInfo.Domain)
+			if err != nil {
+				h.log.Error("vm block list (single-primary)", "host", vmInfo.Host, "domain", vmInfo.Domain, "err", err)
+				_ = kvmClient.DRBDSecondary(ctx, v.Name)
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("list VM block devices on %s: %v", vmInfo.Host, err))
+				return
+			}
+
+			target := vmNextTarget(used)
+			if target == "" {
+				_ = kvmClient.DRBDSecondary(ctx, v.Name)
+				writeError(w, http.StatusInternalServerError, "no free virtio-blk target slots on VM")
+				return
+			}
+
+			if err := kvmClient.VMAttach(ctx, vmInfo.Domain, drbdDevice, target); err != nil {
+				h.log.Error("vm attach (single-primary)", "host", vmInfo.Host, "domain", vmInfo.Domain, "device", drbdDevice, "target", target, "err", err)
+				_ = kvmClient.DRBDSecondary(ctx, v.Name)
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("attach device to VM on %s: %v", vmInfo.Host, err))
+				return
+			}
+
+			v.AttachedTo = req.Node
+			v.AttachedDevice = "pcie:" + target
+			if err := h.store.UpdateVolume(*v); err != nil {
+				h.log.Error("update volume attached_to (single-primary)", "id", id, "err", err)
+				_ = kvmClient.VMDetach(ctx, vmInfo.Domain, target)
+				_ = kvmClient.DRBDSecondary(ctx, v.Name)
+				writeError(w, http.StatusInternalServerError, "failed to update volume")
+				return
+			}
+
+			writeJSON(w, http.StatusOK, publishResponse{
+				Node:   req.Node,
+				Device: "/dev/" + target,
+			})
+
+		default: // "nbd"
+			nbdPort := 10000 + v.Minor
+
+			if err := kvmClient.NBDServe(ctx, drbdDevice, nbdPort); err != nil {
+				h.log.Error("nbd serve (single-primary)", "host", vmInfo.Host, "device", drbdDevice, "port", nbdPort, "err", err)
+				_ = kvmClient.DRBDSecondary(ctx, v.Name)
+				writeError(w, http.StatusInternalServerError, fmt.Sprintf("start NBD server on %s: %v", vmInfo.Host, err))
+				return
+			}
+
+			hostIP := h.agentHostIP(vmInfo.Host)
+			v.AttachedTo = req.Node
+			v.AttachedDevice = fmt.Sprintf("nbd:%d", nbdPort)
+			if err := h.store.UpdateVolume(*v); err != nil {
+				h.log.Error("update volume attached_to (single-primary)", "id", id, "err", err)
+				writeError(w, http.StatusInternalServerError, "failed to update volume")
+				return
+			}
+
+			writeJSON(w, http.StatusOK, publishResponse{
+				Node:    req.Node,
+				Device:  "/dev/nbd0",
+				NBDHost: hostIP,
+				NBDPort: nbdPort,
+			})
 		}
-
-		if err := kvmClient.VMAttach(ctx, vmInfo.Domain, drbdDevice, target); err != nil {
-			h.log.Error("vm attach", "host", vmInfo.Host, "domain", vmInfo.Domain, "device", drbdDevice, "target", target, "err", err)
-			_ = kvmClient.DRBDSecondary(ctx, v.Name)
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("attach device to VM on %s: %v", vmInfo.Host, err))
-			return
-		}
-
-		v.AttachedTo = req.Node
-		v.AttachedDevice = "pcie:" + target
-		if err := h.store.UpdateVolume(*v); err != nil {
-			h.log.Error("update volume attached_to", "id", id, "err", err)
-			_ = kvmClient.VMDetach(ctx, vmInfo.Domain, target)
-			_ = kvmClient.DRBDSecondary(ctx, v.Name)
-			writeError(w, http.StatusInternalServerError, "failed to update volume")
-			return
-		}
-
-		writeJSON(w, http.StatusOK, publishResponse{
-			Node:   req.Node,
-			Device: "/dev/" + target,
-		})
-
-	default: // "nbd"
-		nbdPort := 10000 + v.Minor
-
-		if err := kvmClient.NBDServe(ctx, drbdDevice, nbdPort); err != nil {
-			h.log.Error("nbd serve", "host", vmInfo.Host, "device", drbdDevice, "port", nbdPort, "err", err)
-			_ = kvmClient.DRBDSecondary(ctx, v.Name)
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("start NBD server on %s: %v", vmInfo.Host, err))
-			return
-		}
-
-		hostIP := h.agentHostIP(vmInfo.Host)
-		v.AttachedTo = req.Node
-		v.AttachedDevice = fmt.Sprintf("nbd:%d", nbdPort)
-		if err := h.store.UpdateVolume(*v); err != nil {
-			h.log.Error("update volume attached_to", "id", id, "err", err)
-			writeError(w, http.StatusInternalServerError, "failed to update volume")
-			return
-		}
-
-		writeJSON(w, http.StatusOK, publishResponse{
-			Node:    req.Node,
-			Device:  "/dev/nbd0",
-			NBDHost: hostIP,
-			NBDPort: nbdPort,
-		})
 	}
 }
 
@@ -637,35 +735,43 @@ func (h *Handler) unpublishVolume(w http.ResponseWriter, r *http.Request, id str
 	ctx := r.Context()
 
 	// Detach the volume from its VM (NBD or PCIe).
-	if v.AttachedTo != "" {
-		if vmInfo, err := h.resolveVMInfo(ctx, v.AttachedTo); err == nil {
-			if kvmClient, err := h.clientFor(vmInfo.Host); err == nil {
-				switch {
-				case strings.HasPrefix(v.AttachedDevice, "nbd:"):
-					port := nbdPortFromDevice(v.AttachedDevice)
-					if err := kvmClient.NBDStop(ctx, port); err != nil {
-						h.log.Warn("nbd stop on unpublish", "host", vmInfo.Host, "port", port, "err", err)
-					}
-				case strings.HasPrefix(v.AttachedDevice, "pcie:"):
+	isNBD := strings.HasPrefix(v.AttachedDevice, "nbd:")
+	isPCIe := strings.HasPrefix(v.AttachedDevice, "pcie:")
+
+	if isNBD || v.AttachedDevice == "" {
+		port := 10000 + v.Minor
+		for _, nodeName := range v.Nodes {
+			if client, err := h.clientFor(nodeName); err == nil {
+				h.log.Info("stopping qemu-nbd on node during unpublish", "node", nodeName, "port", port)
+				if err := client.NBDStop(ctx, port); err != nil {
+					h.log.Warn("nbd stop on unpublish", "host", nodeName, "port", port, "err", err)
+				}
+			}
+		}
+	}
+	if isPCIe {
+		if v.AttachedTo != "" {
+			if vmInfo, err := h.resolveVMInfo(ctx, v.AttachedTo); err == nil {
+				if kvmClient, err := h.clientFor(vmInfo.Host); err == nil {
 					target := pcieTargetFromDevice(v.AttachedDevice)
+					h.log.Info("detaching PCIe device from VM during unpublish", "host", vmInfo.Host, "domain", vmInfo.Domain, "target", target)
 					if err := kvmClient.VMDetach(ctx, vmInfo.Domain, target); err != nil {
 						h.log.Warn("vm detach on unpublish", "host", vmInfo.Host, "domain", vmInfo.Domain, "target", target, "err", err)
 					}
 				}
+			} else {
+				h.log.Warn("unable to resolve VM info for unpublish PCIe", "node", v.AttachedTo, "err", err)
 			}
-		} else {
-			h.log.Warn("unable to resolve VM info for unpublish", "node", v.AttachedTo, "err", err)
 		}
 	}
 
+	// Demote all nodes to Secondary.
 	for _, nodeName := range v.Nodes {
-		client, err := h.clientFor(nodeName)
-		if err != nil {
-			h.log.Warn("no client for node during unpublish", "node", nodeName)
-			continue
-		}
-		if err := client.DRBDSecondary(ctx, v.Name); err != nil {
-			h.log.Warn("drbd secondary on unpublish", "node", nodeName, "err", err)
+		if client, err := h.clientFor(nodeName); err == nil {
+			h.log.Info("demoting DRBD to Secondary on node during unpublish", "node", nodeName)
+			if err := client.DRBDSecondary(ctx, v.Name); err != nil {
+				h.log.Warn("drbd secondary on unpublish", "node", nodeName, "err", err)
+			}
 		}
 	}
 

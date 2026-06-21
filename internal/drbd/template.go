@@ -12,6 +12,7 @@ const resTemplate = `resource {{ .Name }} {
   }
   net {
     protocol C;
+    allow-two-primaries yes;
   }
   disk {
     on-io-error detach;
